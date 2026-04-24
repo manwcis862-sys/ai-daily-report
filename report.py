@@ -138,19 +138,48 @@ def gather_news():
     return all_results
 
 
+# ========== 模糊去重 ==========
+def normalize_title(title):
+    """标准化标题用于去重比对"""
+    # 去掉常见来源标记如 "- 新浪财经"、"| 36氪" 等
+    t = re.sub(r'[-–—|]\s*[^|\-–—]+$', '', title)
+    # 去除空格、标点，统一小写
+    t = re.sub(r'[\s\-–—_|·：:，,。.！!？?（）()【\[】\]""\'\']+', '', t)
+    return t.lower()
+
+
+def is_duplicate(title, seen_normalized):
+    """检查标题是否与已见标题重复（模糊匹配）"""
+    norm = normalize_title(title)
+    if not norm:
+        return True
+    if norm in seen_normalized:
+        return True
+    # 检查是否有超过 70% 字符重叠的已见标题
+    for existing in seen_normalized:
+        if len(norm) > 5 and len(existing) > 5:
+            # 计算公共子序列比例
+            common = sum(1 for c in norm if c in existing)
+            ratio = common / max(len(norm), len(existing))
+            if ratio > 0.7:
+                return True
+    return False
+
+
 # ========== 报告生成 ==========
 def generate_report(all_results):
-    seen_titles = set()
+    seen_normalized = set()
     news_items = []
 
     for query, results in all_results.items():
         for r in results:
             title = r.get("title", "").strip()
             snippet = r.get("snippet", "").strip()
-            if not title or title in seen_titles:
+            link = r.get("link", "").strip()
+            if not title or is_duplicate(title, seen_normalized):
                 continue
-            seen_titles.add(title)
-            news_items.append({"title": title, "snippet": snippet, "query": query})
+            seen_normalized.add(normalize_title(title))
+            news_items.append({"title": title, "snippet": snippet, "link": link, "query": query})
 
     categories = {
         "OpenAI": [],
@@ -161,19 +190,24 @@ def generate_report(all_results):
         "行业动态": [],
     }
 
+    # 分类关键词及优先级（按顺序匹配，一条新闻只归一个类）
+    category_rules = [
+        ("OpenAI", ["OpenAI", "ChatGPT", "GPT-", "GPT4", "GPT5", "Codex", "Sora", "o1", "o3", "o4"]),
+        ("Google / Gemini", ["Google", "Gemini", "TPU", "DeepMind", "Bard"]),
+        ("Anthropic / Claude", ["Claude", "Anthropic"]),
+        ("国内大模型", ["腾讯", "阿里", "百度", "Kimi", "月之暗面", "智谱", "混元", "千问", "Qwen", "MiniMax", "百灵", "火山", "通义", "文心", "豆包"]),
+        ("开源生态", ["开源", "DeepSeek", "Llama", "GitHub", "Hugging", "llama"]),
+    ]
+
     for item in news_items:
         t = item["title"] + item["snippet"]
-        if any(k in t for k in ["OpenAI", "ChatGPT", "GPT", "Codex"]):
-            categories["OpenAI"].append(item)
-        elif any(k in t for k in ["Google", "Gemini", "TPU", "DeepMind"]):
-            categories["Google / Gemini"].append(item)
-        elif any(k in t for k in ["Claude", "Anthropic"]):
-            categories["Anthropic / Claude"].append(item)
-        elif any(k in t for k in ["腾讯", "阿里", "百度", "Kimi", "月之暗面", "智谱", "混元", "千问", "Qwen", "MiniMax", "百灵", "火山"]):
-            categories["国内大模型"].append(item)
-        elif any(k in t for k in ["开源", "DeepSeek", "Llama", "GitHub", "Hugging"]):
-            categories["开源生态"].append(item)
-        else:
+        matched = False
+        for cat, keywords in category_rules:
+            if any(k in t for k in keywords):
+                categories[cat].append(item)
+                matched = True
+                break
+        if not matched:
             categories["行业动态"].append(item)
 
     lines = [
