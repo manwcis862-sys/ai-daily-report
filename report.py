@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """
-AI行业日报自动生成 + 邮件发送脚本
-用于 GitHub Actions 定时执行
-搜索使用 Bing RSS + 多源聚合
+AI行业日报 v3 - 多源搜索 + 严格去重
+覆盖：Bing News / Google News / 今日头条 / Reddit / YouTube / X(Nitter)
 """
 
-import os
-import sys
-import smtplib
-import json
-import time
-import re
+import os, sys, smtplib, json, time, re, html
 import xml.etree.ElementTree as ET
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
 from urllib.request import urlopen, Request
 from urllib.parse import quote_plus
-from urllib.error import URLError, HTTPError
 
 # ========== 配置 ==========
 SMTP_HOST = "smtp.qq.com"
@@ -25,264 +18,285 @@ SMTP_PORT = 465
 SMTP_USER = os.environ.get("SMTP_EMAIL", "victory3690@qq.com")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_FROM = SMTP_USER
-TO_EMAIL = os.environ.get("TO_EMAIL", SMTP_USER)
+TO_EMAIL   = os.environ.get("TO_EMAIL", SMTP_USER)
 
-CST = timezone(timedelta(hours=8))
+CST  = timezone(timedelta(hours=8))
 TODAY = datetime.now(CST).strftime("%Y-%m-%d")
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AI-ReportBot/1.0)"}
 
-# ========== 搜索方法 ==========
+# ========== 工具函数 ==========
+def clean(txt):
+    txt = re.sub(r'<[^>]+>', '', txt or '')
+    txt = html.unescape(txt)
+    return txt.strip()[:200]
 
-def search_bing(query, max_results=8):
-    """通过 Bing News RSS 搜索"""
-    results = []
+def fetch_xml(url, timeout=15):
     try:
-        url = f"https://www.bing.com/news/search?q={quote_plus(query)}&format=rss"
         req = Request(url, headers=HEADERS)
-        with urlopen(req, timeout=15) as resp:
-            tree = ET.fromstring(resp.read())
-        for item in tree.findall('.//item')[:max_results]:
-            title = item.findtext('title', '').strip()
-            desc = item.findtext('description', '').strip()
-            link = item.findtext('link', '').strip()
-            # 清理 HTML 标签
-            desc = re.sub(r'<[^>]+>', '', desc)
-            if title:
-                results.append({"title": title, "snippet": desc[:200], "link": link})
+        with urlopen(req, timeout=timeout) as r:
+            return ET.fromstring(r.read())
     except Exception as e:
-        print(f"Bing search error: {e}", file=sys.stderr)
+        print(f"  [XML] {e}", file=sys.stderr)
+        return None
+
+def fetch_json(url, timeout=15):
+    try:
+        req = Request(url, headers={**HEADERS, "Accept": "application/json"})
+        with urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        print(f"  [JSON] {e}", file=sys.stderr)
+        return None
+
+# ========== 搜索：Bing News ==========
+def bing_news(query, n=6):
+    results = []
+    tree = fetch_xml(f"https://www.bing.com/news/search?q={quote_plus(query)}&format=rss")
+    if tree is None:
+        return results
+    for item in tree.findall('.//item')[:n]:
+        t = item.findtext('title','').strip()
+        if t:
+            results.append({"title": t, "snippet": clean(item.findtext('description','')), "src": "Bing"})
     return results
 
-
-def search_google_news_rss(query, max_results=8):
-    """通过 Google News RSS 搜索"""
+# ========== 搜索：今日头条 ==========
+def toutiao(query, n=6):
     results = []
-    try:
-        url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
-        req = Request(url, headers=HEADERS)
-        with urlopen(req, timeout=15) as resp:
-            tree = ET.fromstring(resp.read())
-        for item in tree.findall('.//item')[:max_results]:
-            title = item.findtext('title', '').strip()
-            desc = item.findtext('description', '').strip()
-            link = item.findtext('link', '').strip()
-            desc = re.sub(r'<[^>]+>', '', desc)
-            if title:
-                results.append({"title": title, "snippet": desc[:200], "link": link})
-    except Exception as e:
-        print(f"Google News RSS error: {e}", file=sys.stderr)
+    data = fetch_json(f"https://www.toutiao.com/api/search/?keyword={quote_plus(query)}&pd=synthesis&“云”:0&type=article&source=input&offset=0&count={n}")
+    if data and 'data' in data:
+        for item in data['data'][:n]:
+            t = item.get('title','')
+            if t:
+                results.append({"title": t, "snippet": clean(item.get('abstract','')), "src": "今日头条"})
     return results
 
-
-def search_searxng(query, max_results=8):
-    """使用 SearXNG 公共实例搜索"""
+# ========== 搜索：Reddit ==========
+def reddit(query, n=5):
     results = []
-    instances = [
-        "https://search.sapti.me",
-        "https://searx.be",
-        "https://search.mdosch.de",
-    ]
-    for base in instances:
-        try:
-            url = f"{base}/search?q={quote_plus(query)}&format=json&language=zh"
-            req = Request(url, headers={**HEADERS, "Accept": "application/json"})
-            with urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            for item in data.get("results", [])[:max_results]:
-                results.append({
-                    "title": item.get("title", ""),
-                    "snippet": item.get("content", "")[:200],
-                    "link": item.get("url", "")
-                })
-            if results:
-                return results
-        except Exception:
+    data = fetch_json(f"https://www.reddit.com/search.json?q={quote_plus(query)}&sort=top&t=day&limit={n}")
+    if data and 'data' in data:
+        for item in data['data'].get('children', [])[:n]:
+            p = item.get('data', {})
+            t = p.get('title','')
+            if t:
+                results.append({"title": t, "snippet": clean(p.get('selftext','') or p.get('url','')), "src": "Reddit"})
+    return results
+
+# ========== 搜索：YouTube ==========
+def youtube(query, n=5):
+    results = []
+    tree = fetch_xml(f"https://www.youtube.com/feeds/videos.xml?search_query={quote_plus(query)}&adult=any")
+    if tree is None:
+        return results
+    ns = {'yt': 'http://www.youtube.com/xml/schemas/2015'}
+    for item in tree.findall('.//entry')[:n]:
+        t = item.findtext('{http://www.youtube.com/xml/schemas/2015}videoid', '') or item.findtext('title','')
+        title = item.findtext('title','').strip()
+        author = item.findtext('author/name','').strip()
+        if title:
+            results.append({"title": f"[视频] {title}", "snippet": clean(f"UP主: {author}"), "src": "YouTube"})
+    return results
+
+# ========== 搜索：X / Nitter ==========
+NITTERS = [
+    "https://nitter.privacydev.net",
+    "https://nitter.poast.org",
+    "https://nitter.privacytools.io",
+]
+def x_twitter(query, n=5):
+    results = []
+    for base in NITTERS:
+        url = f"{base}/search/rss?f=tweets&q={quote_plus(query)}"
+        tree = fetch_xml(url)
+        if tree is None:
             continue
+        for item in tree.findall('.//item')[:n]:
+            t = item.findtext('title','').strip()
+            if t:
+                t = re.sub(r'^RT @\w+:\s*', '', t)  # 去掉 RT 前缀
+                results.append({"title": t, "snippet": clean(item.findtext('description','')), "src": "X"})
+        if results:
+            return results
     return results
 
-
-def search(query, max_results=8):
-    """按优先级尝试多种搜索源"""
-    # 1. Bing News RSS（最稳定）
-    results = search_bing(query, max_results)
-    if results:
+# ========== 搜索：Google News ==========
+def google_news(query, n=6):
+    results = []
+    tree = fetch_xml(f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans")
+    if tree is None:
         return results
-    # 2. Google News RSS
-    results = search_google_news_rss(query, max_results)
-    if results:
-        return results
-    # 3. SearXNG
-    results = search_searxng(query, max_results)
+    for item in tree.findall('.//item')[:n]:
+        t = item.findtext('title','').strip()
+        if t:
+            results.append({"title": t, "snippet": clean(item.findtext('description','')), "src": "Google"})
     return results
 
-
-# ========== 新闻收集 ==========
-def gather_news():
-    queries = [
-        "OpenAI ChatGPT AI 最新消息",
-        "Google Gemini Claude AI 大模型",
-        "腾讯 阿里 百度 Kimi AI 大模型",
-        "DeepSeek Qwen 开源大模型 AI",
-        "AI 人工智能 行业动态 最新",
+# ========== 综合搜索 ==========
+def search_all(query, n=5):
+    """对每个 query 并行调用所有来源"""
+    sources = [
+        ("Bing",       bing_news),
+        ("Google",     google_news),
+        ("今日头条",   toutiao),
+        ("Reddit",     reddit),
+        ("YouTube",    youtube),
+        ("X",          x_twitter),
     ]
+    all_src = []
+    for name, fn in sources:
+        r = fn(query, n)
+        if r:
+            print(f"  [{name}] {len(r)} 条")
+            all_src.extend(r)
+        time.sleep(0.5)
+    return all_src
 
-    all_results = {}
-    for q in queries:
-        print(f"Searching: {q}")
-        results = search(q)
-        all_results[q] = results
-        print(f"  -> {len(results)} results")
-        time.sleep(2)
-
-    return all_results
-
-
-# ========== 模糊去重 ==========
-def normalize_title(title):
-    """标准化标题用于去重比对"""
-    # 去掉常见来源标记如 "- 新浪财经"、"| 36氪" 等
-    t = re.sub(r'[-–—|]\s*[^|\-–—]+$', '', title)
-    # 去除空格、标点，统一小写
-    t = re.sub(r'[\s\-–—_|·：:，,。.！!？?（）()【\[】\]""\'\']+', '', t)
+# ========== 严格去重 ==========
+def norm_key(title):
+    """把标题打成"核心词序列"，用于严格去重"""
+    # 去掉开头/结尾的空白、标点、数字
+    t = re.sub(r'^[\s\d\.\,\-\—]+', '', title.strip())
+    # 去掉结尾的来源标记 "- xxx" "| xxx"
+    t = re.sub(r'[-–—|·:：]\s*[^\-–—|·:：]+$', '', t)
+    # 全角转半角
+    t = t.encode('gbk', errors='ignore').decode('gbk')
+    # 去除所有空格和标点
+    t = re.sub(r'[\s\.\,\-\—_\(\)（）\[\]【】""''、，。；：]+', '', t)
     return t.lower()
 
+def deduplicate(items):
+    """严格去重：相同核心词 or 标题前缀相同 → 保留一条"""
+    seen_key   = set()
+    seen_prefix = set()
+    unique = []
+    for it in items:
+        title = it['title'].strip()
+        if not title:
+            continue
+        key = norm_key(title)
+        # 精确命中
+        if key in seen_key:
+            continue
+        # 标题前15字符近似（去掉末尾数字/平台名）
+        prefix = re.sub(r'[\d\.\-]+$', '', key[:15])
+        if prefix in seen_prefix:
+            continue
+        seen_key.add(key)
+        seen_prefix.add(prefix)
+        unique.append(it)
+    return unique
 
-def is_duplicate(title, seen_normalized):
-    """检查标题是否与已见标题重复（模糊匹配）"""
-    norm = normalize_title(title)
-    if not norm:
-        return True
-    if norm in seen_normalized:
-        return True
-    # 检查是否有超过 70% 字符重叠的已见标题
-    for existing in seen_normalized:
-        if len(norm) > 5 and len(existing) > 5:
-            # 计算公共子序列比例
-            common = sum(1 for c in norm if c in existing)
-            ratio = common / max(len(norm), len(existing))
-            if ratio > 0.7:
-                return True
-    return False
+# ========== 生成报告 ==========
+def generate_report(items):
+    items = deduplicate(items)
+    print(f"\n去重后: {len(items)} 条")
 
-
-# ========== 报告生成 ==========
-def generate_report(all_results):
-    seen_normalized = set()
-    news_items = []
-
-    for query, results in all_results.items():
-        for r in results:
-            title = r.get("title", "").strip()
-            snippet = r.get("snippet", "").strip()
-            link = r.get("link", "").strip()
-            if not title or is_duplicate(title, seen_normalized):
-                continue
-            seen_normalized.add(normalize_title(title))
-            news_items.append({"title": title, "snippet": snippet, "link": link, "query": query})
-
-    categories = {
-        "OpenAI": [],
-        "Google / Gemini": [],
+    cats = {
+        "OpenAI / ChatGPT": [],
+        "Google / Gemini":  [],
         "Anthropic / Claude": [],
-        "国内大模型": [],
-        "开源生态": [],
-        "行业动态": [],
+        "国内大模型":       [],
+        "开源生态":         [],
+        "社交媒体热点":     [],
+        "行业动态":         [],
     }
-
-    # 分类关键词及优先级（按顺序匹配，一条新闻只归一个类）
-    category_rules = [
-        ("OpenAI", ["OpenAI", "ChatGPT", "GPT-", "GPT4", "GPT5", "Codex", "Sora", "o1", "o3", "o4"]),
-        ("Google / Gemini", ["Google", "Gemini", "TPU", "DeepMind", "Bard"]),
-        ("Anthropic / Claude", ["Claude", "Anthropic"]),
-        ("国内大模型", ["腾讯", "阿里", "百度", "Kimi", "月之暗面", "智谱", "混元", "千问", "Qwen", "MiniMax", "百灵", "火山", "通义", "文心", "豆包"]),
-        ("开源生态", ["开源", "DeepSeek", "Llama", "GitHub", "Hugging", "llama"]),
+    rules = [
+        ("OpenAI / ChatGPT",   ["OpenAI","ChatGPT","GPT-","GPT5","GPT4","Codex","Sora","o1 ","o3 ","o4 ","Operator"]),
+        ("Google / Gemini",    ["Google","Gemini","TPU","DeepMind","Bard","Workspace"]),
+        ("Anthropic / Claude",["Claude","Anthropic"]),
+        ("国内大模型",         ["腾讯","阿里","百度","Kimi","月之暗面","智谱","混元","千问","Qwen","MiniMax","百灵","火山","通义","文心","豆包","DeepSeek"]),
+        ("开源生态",           ["Llama","llama","Hugging Face","GitHub Trending","开源模型","开源大模型"]),
+        ("社交媒体热点",       ["Reddit","X ","Twitter","YouTube","视频"]),
     ]
-
-    for item in news_items:
-        t = item["title"] + item["snippet"]
+    for it in items:
+        t = it['title'] + it['snippet']
         matched = False
-        for cat, keywords in category_rules:
-            if any(k in t for k in keywords):
-                categories[cat].append(item)
+        for cat, kws in rules:
+            if any(k in t for k in kws):
+                cats[cat].append(it)
                 matched = True
                 break
         if not matched:
-            categories["行业动态"].append(item)
+            cats["行业动态"].append(it)
 
-    lines = [
-        f"AI日报｜{TODAY}",
-        "",
-        f"共收录 {len(news_items)} 条动态，自动搜索整理。",
-        "",
-    ]
-
-    for cat, items in categories.items():
-        if not items:
+    lines = [f"AI日报｜{TODAY}", "", f"共收录 {len(items)} 条（去重后）", ""]
+    for cat, its in cats.items():
+        if not its:
             continue
-        lines.append(f"【{cat}】")
-        for i, item in enumerate(items[:6], 1):
-            lines.append(f"  {i}. {item['title']}")
-            if item["snippet"]:
-                lines.append(f"     {item['snippet']}")
+        lines.append(f"【{cat}】（{len(its)} 条）")
+        for i, it in enumerate(its[:8], 1):
+            lines.append(f"  {i}. {it['title']}")
+            if it['snippet']:
+                lines.append(f"     {it['snippet']}  [{it.get('src','')}]")
         lines.append("")
-
     lines.append(f"生成时间：{datetime.now(CST).strftime('%Y-%m-%d %H:%M')}")
-    lines.append(f"数据来源：Bing News / Google News / SearXNG")
-
+    lines.append("数据源：Bing/Google新闻 / 今日头条 / Reddit / YouTube / X(Nitter)")
     return "\n".join(lines)
-
 
 # ========== 邮件发送 ==========
 def send_email(subject, body):
     if not SMTP_PASS:
-        print("ERROR: SMTP_PASS not set!", file=sys.stderr)
-        return False
-
+        print("ERROR: SMTP_PASS not set!", file=sys.stderr); return False
     msg = MIMEMultipart()
-    msg["From"] = SMTP_FROM
-    msg["To"] = TO_EMAIL
+    msg["From"]    = SMTP_FROM
+    msg["To"]      = TO_EMAIL
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain", "utf-8"))
-
     try:
-        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_FROM, [TO_EMAIL], msg.as_string())
-        server.quit()
-        print(f"Email sent to {TO_EMAIL}")
+        s = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
+        s.login(SMTP_USER, SMTP_PASS)
+        s.sendmail(SMTP_FROM, [TO_EMAIL], msg.as_string())
+        s.quit()
+        print(f"[OK] Email sent → {TO_EMAIL}")
         return True
     except Exception as e:
-        print(f"Email error: {e}", file=sys.stderr)
-        return False
-
+        print(f"[ERROR] {e}", file=sys.stderr); return False
 
 # ========== 主流程 ==========
 def main():
     mode = os.environ.get("REPORT_MODE", "evening").lower()
-    print(f"=== AI Daily Report ===")
-    print(f"Mode: {mode} | Date: {TODAY} | To: {TO_EMAIL}")
+    print(f"=== AI Daily Report v3 === | {mode} | {TODAY}")
 
-    all_results = gather_news()
-    total = sum(len(v) for v in all_results.values())
-    print(f"Total results: {total}")
+    queries = [
+        # 重点：ChatGPT 5.x / OpenAI 新动态
+        "ChatGPT 5.5 OR OpenAI 最新动态 2026",
+        "OpenAI GPT-5 发布 2026",
+        # 国际大模型
+        "Google Gemini Claude AI 动态 2026",
+        "AI 人工智能 最新进展 2026",
+        # 国内
+        "腾讯混元 Kimi 阿里千问 百度文心 智谱AI 2026",
+        "DeepSeek Qwen2.5 开源大模型 最新 2026",
+        # 社交媒体热点
+        "AI Reddit trending 2026",
+        "AI YouTube 最新 2026",
+        "AI X Twitter Elon Musk 2026",
+        # 今日头条
+        "人工智能 大模型 最新消息",
+    ]
 
-    if total == 0:
-        body = f"AI日报｜{TODAY}\n\n今日搜索未获取到结果。\n生成时间：{datetime.now(CST).strftime('%Y-%m-%d %H:%M')}"
-    else:
-        body = generate_report(all_results)
+    all_items = []
+    for q in queries:
+        print(f"Query: {q}")
+        items = search_all(q, n=5)
+        all_items.extend(items)
+        time.sleep(1)
+
+    print(f"\n原始收录: {len(all_items)} 条")
+    body = generate_report(all_items) if all_items else f"AI日报｜{TODAY}\n\n今日未获取到数据。"
 
     subject = f"AI早报｜{TODAY}" if mode == "morning" else f"AI晚报｜{TODAY}"
-    success = send_email(subject, body)
+    ok = send_email(subject, body)
 
-    report_file = f"ai-report-{TODAY}.txt"
-    with open(report_file, "w", encoding="utf-8") as f:
+    fname = f"ai-report-{TODAY}.txt"
+    with open(fname, "w", encoding="utf-8") as f:
         f.write(body)
-    print(f"Report saved to {report_file}")
+    print(f"Report → {fname}")
 
-    if not success:
+    if not ok:
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
