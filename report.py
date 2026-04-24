@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI行业日报 v3 - 多源搜索 + 严格去重
+AI行业日报 v4 - 多源搜索 + 严格去重
 覆盖：Bing News / Google News / 今日头条 / Reddit / YouTube / X(Nitter)
 """
 
@@ -64,7 +64,7 @@ def bing_news(query, n=6):
 # ========== 搜索：今日头条 ==========
 def toutiao(query, n=6):
     results = []
-    data = fetch_json(f"https://www.toutiao.com/api/search/?keyword={quote_plus(query)}&pd=synthesis&“云”:0&type=article&source=input&offset=0&count={n}")
+    data = fetch_json(f"https://www.toutiao.com/api/search/?keyword={quote_plus(query)}&pd=synthesis&offset=0&count={n}")
     if data and 'data' in data:
         for item in data['data'][:n]:
             t = item.get('title','')
@@ -87,16 +87,16 @@ def reddit(query, n=5):
 # ========== 搜索：YouTube ==========
 def youtube(query, n=5):
     results = []
-    tree = fetch_xml(f"https://www.youtube.com/feeds/videos.xml?search_query={quote_plus(query)}&adult=any")
+    tree = fetch_xml(f"https://www.youtube.com/feeds/videos.xml?search_query={quote_plus(query)}")
     if tree is None:
         return results
-    ns = {'yt': 'http://www.youtube.com/xml/schemas/2015'}
+    ns = 'http://www.youtube.com/xml/schemas/2015'
     for item in tree.findall('.//entry')[:n]:
-        t = item.findtext('{http://www.youtube.com/xml/schemas/2015}videoid', '') or item.findtext('title','')
-        title = item.findtext('title','').strip()
+        title = item.findtext(f'{{{ns}}}videoid', '') or item.findtext('title','')
         author = item.findtext('author/name','').strip()
-        if title:
-            results.append({"title": f"[视频] {title}", "snippet": clean(f"UP主: {author}"), "src": "YouTube"})
+        raw_title = item.findtext('title','').strip()
+        if raw_title:
+            results.append({"title": f"[视频] {raw_title}", "snippet": f"UP主: {author}", "src": "YouTube"})
     return results
 
 # ========== 搜索：X / Nitter ==========
@@ -115,7 +115,7 @@ def x_twitter(query, n=5):
         for item in tree.findall('.//item')[:n]:
             t = item.findtext('title','').strip()
             if t:
-                t = re.sub(r'^RT @\w+:\s*', '', t)  # 去掉 RT 前缀
+                t = re.sub(r'^RT @\w+:\s*', '', t)
                 results.append({"title": t, "snippet": clean(item.findtext('description','')), "src": "X"})
         if results:
             return results
@@ -135,14 +135,13 @@ def google_news(query, n=6):
 
 # ========== 综合搜索 ==========
 def search_all(query, n=5):
-    """对每个 query 并行调用所有来源"""
     sources = [
-        ("Bing",       bing_news),
-        ("Google",     google_news),
-        ("今日头条",   toutiao),
-        ("Reddit",     reddit),
-        ("YouTube",    youtube),
-        ("X",          x_twitter),
+        ("Bing",     bing_news),
+        ("Google",   google_news),
+        ("今日头条", toutiao),
+        ("Reddit",   reddit),
+        ("YouTube",  youtube),
+        ("X",        x_twitter),
     ]
     all_src = []
     for name, fn in sources:
@@ -154,38 +153,41 @@ def search_all(query, n=5):
     return all_src
 
 # ========== 严格去重 ==========
-def norm_key(title):
-    """把标题打成"核心词序列"，用于严格去重"""
-    # 去掉开头/结尾的空白、标点、数字
-    t = re.sub(r'^[\s\d\.\,\-\—]+', '', title.strip())
-    # 去掉结尾的来源标记 "- xxx" "| xxx"
-    t = re.sub(r'[-–—|·:：]\s*[^\-–—|·:：]+$', '', t)
-    # 全角转半角
-    t = t.encode('gbk', errors='ignore').decode('gbk')
-    # 去除所有空格和标点
-    t = re.sub(r'[\s\.\,\-\—_\(\)（）\[\]【】""''、，。；：]+', '', t)
+def title_fp(title):
+    """标题指纹：去除所有空格/标点/数字/开头语气词，统一小写"""
+    t = re.sub(r'^[\s\d\.\,\-\—\(\)]+', '', title.strip())
+    t = re.sub(r'[\s\.\,\-\—_\(\)\（\)\[\]\【\】""''、，。；：抖音油管]+', '', t)
+    t = re.sub(r'^(重磅|突发|刚刚|爆料|炸裂|震惊|消息|新闻|快讯|日报|快报|热文|曝光)+', '', t, flags=re.IGNORECASE)
     return t.lower()
 
+def jaccard(a, b):
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
 def deduplicate(items):
-    """严格去重：相同核心词 or 标题前缀相同 → 保留一条"""
-    seen_key   = set()
-    seen_prefix = set()
+    """严格去重：指纹相同 或 前15字相同 或 Jaccard>0.6 → 只留一条"""
     unique = []
     for it in items:
         title = it['title'].strip()
         if not title:
             continue
-        key = norm_key(title)
-        # 精确命中
-        if key in seen_key:
-            continue
-        # 标题前15字符近似（去掉末尾数字/平台名）
-        prefix = re.sub(r'[\d\.\-]+$', '', key[:15])
-        if prefix in seen_prefix:
-            continue
-        seen_key.add(key)
-        seen_prefix.add(prefix)
-        unique.append(it)
+        fp = title_fp(title)
+        keep = True
+        for ex in unique:
+            efp = title_fp(ex['title'])
+            if fp == efp:
+                keep = False
+                break
+            if fp[:15] and efp[:15] and fp[:15] == efp[:15]:
+                keep = False
+                break
+            if jaccard(fp, efp) > 0.6:
+                keep = False
+                break
+        if keep:
+            unique.append(it)
     return unique
 
 # ========== 生成报告 ==========
@@ -194,21 +196,21 @@ def generate_report(items):
     print(f"\n去重后: {len(items)} 条")
 
     cats = {
-        "OpenAI / ChatGPT": [],
-        "Google / Gemini":  [],
-        "Anthropic / Claude": [],
-        "国内大模型":       [],
-        "开源生态":         [],
-        "社交媒体热点":     [],
-        "行业动态":         [],
+        "OpenAI / ChatGPT":    [],
+        "Google / Gemini":     [],
+        "Anthropic / Claude":  [],
+        "国内大模型":          [],
+        "开源生态":            [],
+        "社交媒体热点":        [],
+        "行业动态":            [],
     }
     rules = [
-        ("OpenAI / ChatGPT",   ["OpenAI","ChatGPT","GPT-","GPT5","GPT4","Codex","Sora","o1 ","o3 ","o4 ","Operator"]),
+        ("OpenAI / ChatGPT",   ["OpenAI","ChatGPT","GPT-","GPT5","GPT4","Codex","Sora","o1 ","o3 ","o4 ","Operator","ChatGPT 5"]),
         ("Google / Gemini",    ["Google","Gemini","TPU","DeepMind","Bard","Workspace"]),
         ("Anthropic / Claude",["Claude","Anthropic"]),
         ("国内大模型",         ["腾讯","阿里","百度","Kimi","月之暗面","智谱","混元","千问","Qwen","MiniMax","百灵","火山","通义","文心","豆包","DeepSeek"]),
         ("开源生态",           ["Llama","llama","Hugging Face","GitHub Trending","开源模型","开源大模型"]),
-        ("社交媒体热点",       ["Reddit","X ","Twitter","YouTube","视频"]),
+        ("社交媒体热点",       ["Reddit","X ","Twitter","[视频]"]),  # [视频] 标记 YouTube
     ]
     for it in items:
         t = it['title'] + it['snippet']
@@ -238,7 +240,8 @@ def generate_report(items):
 # ========== 邮件发送 ==========
 def send_email(subject, body):
     if not SMTP_PASS:
-        print("ERROR: SMTP_PASS not set!", file=sys.stderr); return False
+        print("ERROR: SMTP_PASS not set!", file=sys.stderr)
+        return False
     msg = MIMEMultipart()
     msg["From"]    = SMTP_FROM
     msg["To"]      = TO_EMAIL
@@ -249,27 +252,28 @@ def send_email(subject, body):
         s.login(SMTP_USER, SMTP_PASS)
         s.sendmail(SMTP_FROM, [TO_EMAIL], msg.as_string())
         s.quit()
-        print(f"[OK] Email sent → {TO_EMAIL}")
+        print(f"[OK] Email sent -> {TO_EMAIL}")
         return True
     except Exception as e:
-        print(f"[ERROR] {e}", file=sys.stderr); return False
+        print(f"[ERROR] {e}", file=sys.stderr)
+        return False
 
 # ========== 主流程 ==========
 def main():
     mode = os.environ.get("REPORT_MODE", "evening").lower()
-    print(f"=== AI Daily Report v3 === | {mode} | {TODAY}")
+    print(f"=== AI Daily Report v4 === | {mode} | {TODAY}")
 
     queries = [
-        # 重点：ChatGPT 5.x / OpenAI 新动态
+        # OpenAI / ChatGPT 重点查询
         "ChatGPT 5.5 OR OpenAI 最新动态 2026",
         "OpenAI GPT-5 发布 2026",
+        "AI 人工智能 最新进展 2026",
         # 国际大模型
         "Google Gemini Claude AI 动态 2026",
-        "AI 人工智能 最新进展 2026",
         # 国内
         "腾讯混元 Kimi 阿里千问 百度文心 智谱AI 2026",
         "DeepSeek Qwen2.5 开源大模型 最新 2026",
-        # 社交媒体热点
+        # 社交媒体
         "AI Reddit trending 2026",
         "AI YouTube 最新 2026",
         "AI X Twitter Elon Musk 2026",
@@ -293,7 +297,7 @@ def main():
     fname = f"ai-report-{TODAY}.txt"
     with open(fname, "w", encoding="utf-8") as f:
         f.write(body)
-    print(f"Report → {fname}")
+    print(f"Report -> {fname}")
 
     if not ok:
         sys.exit(1)
