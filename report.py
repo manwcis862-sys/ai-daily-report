@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI行业日报 v4 - 多源搜索 + 严格去重
+AI行业日报 v5 - 三行式报道 + 严格去重
 覆盖：Bing News / Google News / 今日头条 / Reddit / YouTube / X(Nitter)
 """
 
@@ -134,7 +134,7 @@ def google_news(query, n=6):
     return results
 
 # ========== 综合搜索 ==========
-def search_all(query, n=5):
+def search_all(query, n=8):
     sources = [
         ("Bing",     bing_news),
         ("Google",   google_news),
@@ -228,13 +228,20 @@ def generate_report(items):
         if not its:
             continue
         lines.append(f"【{cat}】（{len(its)} 条）")
-        for i, it in enumerate(its[:8], 1):
-            lines.append(f"  {i}. {it['title']}")
-            if it['snippet']:
-                lines.append(f"     {it['snippet']}  [{it.get('src','')}]")
         lines.append("")
+        for i, it in enumerate(its[:10], 1):
+            title = it['title'].strip()
+            snippet = it.get('snippet', '').strip()
+            src = it.get('src', 'Bing')
+            # 去掉 [视频] 等前缀，让来源字段统一处理
+            title = re.sub(r'^\[视频\]\s*', '', title)
+            lines.append(f"{i}. {title}")
+            if snippet:
+                lines.append(f"   关键｜{snippet}")
+            lines.append(f"   来源｜{src}")
+            lines.append("")
     lines.append(f"生成时间：{datetime.now(CST).strftime('%Y-%m-%d %H:%M')}")
-    lines.append("数据源：Bing/Google新闻 / 今日头条 / Reddit / YouTube / X(Nitter)")
+    lines.append("数据源：Bing / Google新闻 / 今日头条 / Reddit / YouTube / X(Nitter)")
     return "\n".join(lines)
 
 # ========== 邮件发送 ==========
@@ -261,7 +268,7 @@ def send_email(subject, body):
 # ========== 主流程 ==========
 def main():
     mode = os.environ.get("REPORT_MODE", "evening").lower()
-    print(f"=== AI Daily Report v4 === | {mode} | {TODAY}")
+    print(f"=== AI Daily Report v5 === | {mode} | {TODAY}")
 
     queries = [
         # OpenAI / ChatGPT 重点查询
@@ -286,7 +293,7 @@ def main():
         print(f"Query: {q}")
         items = search_all(q, n=5)
         all_items.extend(items)
-        time.sleep(1)
+        time.sleep(0.3)
 
     print(f"\n原始收录: {len(all_items)} 条")
     body = generate_report(all_items) if all_items else f"AI日报｜{TODAY}\n\n今日未获取到数据。"
