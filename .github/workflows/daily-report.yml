@@ -1,9 +1,13 @@
 name: AI Daily Report
 
 on:
+  # 每天北京时间 09:00 (UTC 01:00) 发早报
+  # 每天北京时间 19:00 (UTC 11:00) 发晚报
   schedule:
-    - cron: '0 1 * * *'
-    - cron: '0 11 * * *'
+    - cron: '0 1 * * *'   # 早报 09:00 CST
+    - cron: '0 11 * * *'  # 晚报 19:00 CST
+
+  # 支持手动触发测试
   workflow_dispatch:
     inputs:
       mode:
@@ -17,17 +21,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install anthropic
+
       - name: Morning Report
         env:
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           REPORT_MODE: morning
         run: python report.py
+
       - name: Upload Report
         uses: actions/upload-artifact@v4
         with:
@@ -39,17 +50,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install anthropic
+
       - name: Evening Report
         env:
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           REPORT_MODE: evening
         run: python report.py
+
       - name: Upload Report
         uses: actions/upload-artifact@v4
         with:
